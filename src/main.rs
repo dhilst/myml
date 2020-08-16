@@ -1,23 +1,16 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use std::fs;
-use std::io::{self, BufRead, BufReader, Cursor};
-use std::iter::Iterator;
-use std::path;
-
-fn main() {}
-
-use std::iter::{FilterMap, FlatMap};
-
-#[derive(Debug, PartialEq)]
-enum Expr {
-    ValInt(String, i32),
-}
-
 use regex::Regex;
 use std::error;
 use std::fmt;
+use std::fs;
+use std::io::{self, BufRead, BufReader, Cursor};
+use std::iter::Iterator;
+use std::iter::{FilterMap, FlatMap};
+use std::path;
+
+fn main() {}
 
 #[derive(Debug)]
 struct ParseError {
@@ -51,75 +44,276 @@ struct ParsedStuff<'a, T> {
 }
 
 type ParseResult<'a, T> = Result<ParsedStuff<'a, T>, Box<dyn error::Error>>;
-type VoidResult<'a> = Result<&'a str, Box<dyn error::Error>>;
 
-fn regex<'a, T>(p: &str, input: &'a str, transform: fn(capture: &str) -> T) -> ParseResult<'a, T> {
-    match Regex::new(p).unwrap().captures(input) {
-        Some(t) => {
-            let len = t[0].len();
-            Ok(ParsedStuff {
-                i: &input[len..],
-                value: transform(&t[0]),
-            })
-        }
+#[derive(Debug, PartialEq)]
+enum Subexpr {
+    Int(i32),
+    Symbol(String),
+    SumInt(String, Box<Subexpr>, Box<Subexpr>),
+    MulInt(String, Box<Subexpr>, Box<Subexpr>),
+    Sequence(Vec<Subexpr>),
+    Keyword(String),
+    Literal(String),
+    Operator(i32, String),
+    BinExpr(String, Box<Subexpr>, Box<Subexpr>),
+}
+
+fn regex<'a, T>(p: &str, input: &'a str, transform: &dyn Fn(&str) -> T) -> ParseResult<'a, T> {
+    let pat = format!(r"^\s*{}", p);
+    match Regex::new(&pat).unwrap().find(input) {
+        Some(m) => Ok(ParsedStuff {
+            i: &input[m.end()..],
+            value: transform(&m.as_str().trim()),
+        }),
         None => ParseError::expected(p, input),
     }
 }
 
-fn int(i: &str) -> ParseResult<i32> {
-    regex(r"\d+", i, |x| x.parse::<i32>().unwrap())
+fn int(i: &str) -> ParseResult<Subexpr> {
+    regex(r"^\s*\d+", i, &|x| Subexpr::Int(x.parse::<i32>().unwrap()))
 }
 
-fn literal<'a>(expected: &str, i: &'a str) -> VoidResult<'a> {
-    regex(expected, i, |_| ()).map(|x| x.i)
+fn literalp<'a>(expected: &'a str) -> impl Fn(&'a str) -> ParseResult<Subexpr> {
+    let f = move |x: &str| Subexpr::Literal(x.to_owned());
+    move |i| regex(expected, i, &f)
 }
 
-fn val(i: &str) -> VoidResult {
-    literal("val", i)
+fn opp<'a>(precedence: i32, expected: &'a str) -> impl Fn(&'a str) -> ParseResult<Subexpr> {
+    let f = move |x: &str| Subexpr::Operator(precedence, x.to_owned());
+    move |i| regex(expected, i, &f)
 }
 
-fn equal(i: &str) -> VoidResult {
-    literal("=", i)
+fn keyword<'a, 'e>(expected: &'e str, i: &'a str) -> ParseResult<'a, Subexpr> {
+    let f = move |x: &str| Subexpr::Keyword(x.to_owned());
+    regex(expected, i, &f)
 }
 
-fn semicolon(i: &str) -> VoidResult {
-    literal(";", i)
+fn keywordp<'a>(expected: &'a str) -> impl Fn(&'a str) -> ParseResult<Subexpr> {
+    let f = move |x: &str| Subexpr::Keyword(x.to_owned());
+    move |i| regex(expected, i, &f)
 }
 
-fn symbol(i: &str) -> ParseResult<String> {
-    regex(r"\w+", i, |x| x.to_owned())
+fn symbol(i: &str) -> ParseResult<Subexpr> {
+    regex(r"[a-z_][a-z0-9_]*", i, &|x| Subexpr::Symbol(x.to_owned()))
 }
 
-fn val_expr(i: &str) -> ParseResult<(String, i32)> {
-    let i: &str = val(i)?;
-    let ParsedStuff { i, value: symbol } = symbol(i)?;
-    let i: &str = equal(i)?;
-    let ParsedStuff { i, value } = int(i)?;
-    let i = semicolon(i)?;
+// expr:
+//   | plusminus { ... }
+//
+// plusminus:
+//   | plusminus PLUS  timesdiv { ... }
+//   | plusminus MINUS timesdiv { ... }
+//   | timesdiv                 { ... }
+//
+// timesdiv:
+//   | timesdiv DIV   atom { ... }
+//   | timesdiv TIMES atom { ... }
+//   | atom                { ... }
+//
+// atom:
+//   | VAR                { ... }
+//   | NUM                { ... }
+//   | LPAREN expr RPAREN { ... }
 
-    Ok(ParsedStuff {
+fn parse(i: &str) -> ParseResult<Subexpr> {
+    env_logger::init();
+    expr(i)
+}
+
+fn expr(i: &str) -> ParseResult<Subexpr> {
+    plusminus(i)
+}
+
+extern crate log;
+fn plusminus(i: &str) -> ParseResult<Subexpr> {
+    println!("plusminus called with i={}", i);
+    or(
         i,
-        value: (symbol, value),
-    })
+        "plusminus",
+        vec![&|i| binop(i, opp(0, "[+-]"), atom, plusminus), &|i| {
+            sequence(i, vec![&atom, &literalp(";")])
+        }],
+    )
 }
 
-// val foo = 10: int;;
+fn atom(i: &str) -> ParseResult<Subexpr> {
+    println!("atom      called with i={}", i);
+    or(i, "atom", vec![&symbol, &int])
+}
+
+fn or<'a>(
+    i: &'a str,
+    err: &str,
+    parsers: Vec<&dyn Fn(&'a str) -> ParseResult<Subexpr>>,
+) -> ParseResult<'a, Subexpr> {
+    println!("or        called with i={}", i);
+    for p in parsers {
+        let v = p(i);
+        if v.is_ok() {
+            return v;
+        }
+    }
+
+    ParseError::expected(err, i)
+}
+
+fn sequence<'a>(
+    i: &'a str,
+    parsers: Vec<&dyn Fn(&'a str) -> ParseResult<Subexpr>>,
+) -> ParseResult<'a, Subexpr> {
+    let mut expr = Vec::new();
+    let mut input = i;
+
+    for p in parsers {
+        let ParsedStuff { i, value } = p(input)?;
+        input = i;
+        match value {
+            Subexpr::Literal(_) => {}                   // discart literals
+            Subexpr::Sequence(seq) => expr.extend(seq), // flat sequences
+            _ => expr.push(value),
+        }
+    }
+
+    match expr.len() {
+        n if n == 1 => Ok(ParsedStuff {
+            i: input,
+            value: expr.pop().unwrap(),
+        }),
+        _ => Ok(ParsedStuff {
+            i: input,
+            value: Subexpr::Sequence(expr),
+        }),
+    }
+}
+
+fn binop<'a>(
+    i: &'a str,
+    op: impl Fn(&'a str) -> ParseResult<Subexpr>,
+    p1: impl Fn(&'a str) -> ParseResult<Subexpr>,
+    p2: impl Fn(&'a str) -> ParseResult<Subexpr>,
+) -> ParseResult<'a, Subexpr> {
+    println!("binop     called with i={}", i);
+    let ParsedStuff { i, value: a } = p1(i)?;
+    let ParsedStuff { i, value: op } = op(i)?;
+    let ParsedStuff { i, value: b } = p2(i)?;
+
+    let opsym = match op {
+        Subexpr::Operator(_, s) => s,
+        _ => {
+            println!("binop error op operator, readed s={:?}", op);
+            return ParseError::expected("symbol or operator literal", i);
+        }
+    };
+
+    return Ok(ParsedStuff {
+        i,
+        value: Subexpr::BinExpr(opsym, Box::new(a), Box::new(b)),
+    });
+}
 
 mod test {
     use super::*;
 
     #[test]
     fn test_int() {
-        assert_eq!(ParsedStuff { i: "", value: 1 }, int("1").unwrap());
-    }
-
-    fn test_val_expr() {
         assert_eq!(
             ParsedStuff {
                 i: "",
-                value: ("foo".to_owned(), 1),
+                value: Subexpr::Int(1)
             },
-            val_expr("val foo = 1;").unwrap()
+            int(" 1").unwrap()
         );
+    }
+
+    #[test]
+    fn test_sequence() {
+        let res = sequence("1 1;", vec![&int, &int, &literalp(";")])
+            .unwrap()
+            .value;
+        assert_eq!(
+            Subexpr::Sequence(vec![
+                Subexpr::Int(1),
+                Subexpr::Int(1),
+                Subexpr::Literal(";".into())
+            ]),
+            res
+        )
+    }
+
+    #[test]
+    fn test_or() {
+        let res = or("1", "error", vec![&literalp("a"), &int]).unwrap().value;
+        assert_eq!(Subexpr::Int(1), res)
+    }
+
+    #[test]
+    fn test_plusminus1() {
+        let res = plusminus("1;").unwrap().value;
+        assert_eq!(
+            Subexpr::Sequence(vec![Subexpr::Int(1), Subexpr::Literal(";".into())]),
+            res
+        );
+    }
+
+    #[test]
+    fn test_plusminus2() {
+        let res = plusminus("1 + 1;").unwrap().value;
+        assert_eq!(
+            Subexpr::Sequence(vec![
+                Subexpr::Int(1),
+                Subexpr::Operator(0, "+".into()),
+                Subexpr::Sequence(vec![Subexpr::Int(1), Subexpr::Literal(";".into())])
+            ]),
+            res
+        );
+    }
+
+    #[test]
+    fn test_plusminus3() {
+        let res = plusminus("a + 1 + b;").unwrap().value;
+        assert_eq!(
+            Subexpr::Sequence(vec![
+                Subexpr::Symbol("a".to_owned()),
+                Subexpr::Operator(0, "+".into()),
+                Subexpr::Int(1),
+                Subexpr::Operator(0, "+".into()),
+                Subexpr::Sequence(vec![
+                    Subexpr::Symbol("b".into()),
+                    Subexpr::Literal(";".into())
+                ]),
+            ]),
+            res
+        );
+    }
+
+    #[test]
+    fn test_atom() {
+        let res = atom(" a;").unwrap().value;
+        println!("{:?}", res);
+    }
+
+    #[test]
+    fn test_timesdiv1() {
+        let res = expr("1 + 1;").unwrap().value;
+        assert_eq!(
+            Subexpr::Sequence(vec![
+                Subexpr::Symbol("a".to_owned()),
+                Subexpr::Operator(0, "+".into()),
+                Subexpr::Sequence(vec![
+                    Subexpr::Int(1),
+                    Subexpr::Operator(1, "*".into()),
+                    Subexpr::Symbol("b".into()),
+                    Subexpr::Literal(";".into())
+                ]),
+            ]),
+            res
+        );
+    }
+
+    #[test]
+    fn test_binop() {
+        let plus = literalp(r"\+");
+        let res = binop("a + b", plus, atom, atom).unwrap();
+        println!("{:?}", res);
     }
 }
