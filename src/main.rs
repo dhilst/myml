@@ -55,7 +55,7 @@ enum Subexpr {
     Keyword(String),
     Literal(String),
     Operator(i32, String),
-    BinExpr(String, Box<Subexpr>, Box<Subexpr>),
+    BinExpr(Box<Subexpr>, Box<Subexpr>, Box<Subexpr>),
 }
 
 fn regex<'a, T>(p: &str, input: &'a str, transform: &dyn Fn(&str) -> T) -> ParseResult<'a, T> {
@@ -130,9 +130,11 @@ fn plusminus(i: &str) -> ParseResult<Subexpr> {
     or(
         i,
         "plusminus",
-        vec![&|i| binop(i, opp(0, "[+-]"), atom, plusminus), &|i| {
-            sequence(i, vec![&atom, &literalp(";")])
-        }],
+        vec![
+            &|i| binop(i, opp(0, "[+-]"), atom, plusminus),
+            &|i| binop(i, opp(1, "[*/]"), atom, plusminus),
+            &|i| sequence(i, vec![&atom, &literalp(";")]),
+        ],
     )
 }
 
@@ -197,17 +199,9 @@ fn binop<'a>(
     let ParsedStuff { i, value: op } = op(i)?;
     let ParsedStuff { i, value: b } = p2(i)?;
 
-    let opsym = match op {
-        Subexpr::Operator(_, s) => s,
-        _ => {
-            println!("binop error op operator, readed s={:?}", op);
-            return ParseError::expected("symbol or operator literal", i);
-        }
-    };
-
     return Ok(ParsedStuff {
         i,
-        value: Subexpr::BinExpr(opsym, Box::new(a), Box::new(b)),
+        value: Subexpr::BinExpr(Box::new(a), Box::new(op), Box::new(b)),
     });
 }
 
@@ -294,20 +288,14 @@ mod test {
 
     #[test]
     fn test_timesdiv1() {
-        let res = expr("1 + 1;").unwrap().value;
-        assert_eq!(
-            Subexpr::Sequence(vec![
-                Subexpr::Symbol("a".to_owned()),
-                Subexpr::Operator(0, "+".into()),
-                Subexpr::Sequence(vec![
-                    Subexpr::Int(1),
-                    Subexpr::Operator(1, "*".into()),
-                    Subexpr::Symbol("b".into()),
-                    Subexpr::Literal(";".into())
-                ]),
-            ]),
-            res
-        );
+        let res = expr("1 + 1 + a;").unwrap().value;
+        println!("{:?}", res);
+    }
+
+    #[test]
+    fn test_timesdiv2() {
+        let res = expr("1 + 1 * a;").unwrap().value;
+        println!("{:?}", res);
     }
 
     #[test]
